@@ -6,7 +6,7 @@
 与本仓库已记录的基线（watchdog-state.json）比对。
 
 发现微软发布了更高的 build 时：
-  - 输出 new=true 并列出变化（供 GitHub Actions 开 Issue + 触发构建）
+  - 输出 new=true 并列出变化（供 GitHub Actions 触发构建 + 更新基线）
   - 更新 watchdog-state.json 基线
 
 设计要点：

@@ -1,6 +1,13 @@
 name: Windows ISO Auto Patch (All Versions)
 
 on:
+  # 定时轮询：每 6 小时检测一次 adavak/Win_ISO_Patching_Scripts 的 meta4 变化。
+  # 微软发布新 Windows 构建后，社区会更新对应 *.meta4，本工作流的「Check if workflow should run」
+  # 步骤比对 meta4 哈希，无变化则 skip（几乎零成本），有变化则自动拉取、构建并发布 Release。
+  # 这样无需手动点 Actions，实现「微软更新 → 仓库自动制作发布」。
+  # 注：若想更及时，可改为 "0 */3 * * *"（每 3 小时）。
+  schedule:
+    - cron: "0 */6 * * *"
   workflow_dispatch:
 
 permissions:
@@ -321,3 +328,23 @@ jobs:
           files: release/*.zip.*
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # 13. 通知博客仓库立即同步数据（可选增强）
+      # 前置条件：仓库 Settings → Secrets 配置 HEXO_PAT（需具备 xfxx2022/hexo 的 repo 权限的 Personal Access Token）。
+      # 未配置时不报错（continue-on-error），博客侧仍由每 6 小时定时任务兜底同步。
+      - name: Notify blog repo to sync
+        if: steps.check.outputs.run == 'true'
+        continue-on-error: true
+        shell: pwsh
+        env:
+          HEXO_PAT: ${{ secrets.HEXO_PAT }}
+        run: |
+          if (-not $env:HEXO_PAT) { Write-Host "HEXO_PAT 未配置，跳过即时通知（博客将靠定时任务兜底同步）"; exit 0 }
+          $api = "https://api.github.com/repos/xfxx2022/hexo/dispatches"
+          $body = @{ event_type = "win_iso_updated" } | ConvertTo-Json -Compress
+          try {
+            Invoke-RestMethod -Method Post -Uri $api -Headers @{Authorization = "token $env:HEXO_PAT"; Accept = "application/vnd.github+json" } -Body $body -ContentType "application/json"
+            Write-Host "已向博客仓库发送 win_iso_updated 事件，触发即时同步"
+          } catch {
+            Write-Host "通知博客失败（不影响本次构建）: $($_.Exception.Message)"
+          }

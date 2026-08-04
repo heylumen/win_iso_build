@@ -1,0 +1,89 @@
+name: Watchdog · 微软官方版本监控
+
+# 独立监控工作流：周期性抓取微软官方 release-info 页面，
+# 一旦发现我们跟踪的产品线（Win11 26200 / Win10 19044·17763·14393）发布了更高 build，
+# 立即：① 开 Issue 提醒（上游 adavak 数据到位前本仓库无法真正制作）
+#       ② 触发 auto_patch.yml 构建（best-effort，上游 meta4 未更新时其内部哈希门控会自动 skip，零成本）
+# 形成闭环：微软更新 → watchdog 秒级发现 → 提醒 + 尝试构建 → 上游到位即自动发布。
+
+on:
+  schedule:
+    - cron: "17 */3 * * *"        # 每 3 小时错峰检测（避开整点），比 6h 更灵敏
+  workflow_dispatch:
+  repository_dispatch:
+    types: [check_ms_releases]
+
+permissions:
+  contents: write     # 更新 tools/watchdog-state.json 基线
+  issues: write       # 新构建时开 Issue 提醒
+  actions: write      # 触发 auto_patch.yml 构建
+
+concurrency:
+  group: ms-watchdog
+  cancel-in-progress: false
+
+jobs:
+  watchdog:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: 抓取微软官方 release-info 并比对
+        id: check
+        run: python3 tools/watchdog_ms_release.py
+
+      - name: 发现新构建 → 开 Issue 提醒（去重）
+        if: steps.check.outputs.new == 'true'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const detail = `${{ steps.check.outputs.detail }}`;
+            const search = await github.rest.issues.listForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: 'open',
+              per_page: 50
+            });
+            const dup = search.data.find(i => i.title.startsWith('[Watchdog] 微软发布新'));
+            if (dup) {
+              core.info('已存在同类未关闭 Issue #' + dup.number + '，跳过新建');
+              return;
+            }
+            await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: `[Watchdog] 微软发布新 Windows 构建，待上游制作：${detail}`,
+              body: [
+                '微软官方已发布新构建，但上游 adavak 仓库尚未更新 meta4，本仓库暂无法自动制作。',
+                '',
+                '本次检测到：',
+                detail,
+                '',
+                '说明：本 Issue 用于提醒维护者「微软已出新版，上游数据到位后才会真正构建」。',
+                '待 win_iso_build 实际发布对应 Release 后可手动关闭本 Issue。'
+              ].join('\n')
+            });
+
+      - name: 触发自动构建（best-effort，上游数据未到位时会自动跳过）
+        if: steps.check.outputs.new == 'true'
+        continue-on-error: true
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.actions.createWorkflowDispatch({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              workflow_id: 'auto_patch.yml',
+              ref: 'main'
+            });
+            core.info('已触发 auto_patch.yml 构建（若上游 meta4 未更新将自动 skip）');
+
+      - name: 提交更新后的基线（仅当有变化时）
+        if: steps.check.outputs.new == 'true'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add tools/watchdog-state.json
+          git commit -m "watchdog: 更新微软构建基线" || echo "无变化可提交"
+          git push

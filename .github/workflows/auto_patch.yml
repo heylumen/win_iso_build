@@ -19,6 +19,10 @@ env:
   SPLIT_SIZE: 2000m
   SEVENZIP: "C:\\Program Files\\7-Zip\\7z.exe"
 
+concurrency:
+  group: auto-patch
+  cancel-in-progress: false
+
 jobs:
   generate-matrix:
     runs-on: ubuntu-latest
@@ -34,18 +38,42 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Continue'
+          $api = "https://api.github.com/repos/${{ github.repository }}/actions/runs"
+
+          # 删除带指数退避重试，规避 GitHub API 偶发 403 限流导致旧 run 残留
+          function Remove-RunWithRetry($id, [int]$maxAttempts=4, [int]$baseDelay=15) {
+            for ($i = 1; $i -le $maxAttempts; $i++) {
+              try {
+                Invoke-RestMethod -Method Delete -Uri "$api/$id" -Headers @{Authorization = "token $env:GH_TOKEN"} -ErrorAction Stop
+                Write-Host "  OK delete $id"
+                return $true
+              } catch {
+                $status = $_.Exception.Response.StatusCode.value__
+                Write-Host "  FAIL delete $id (attempt $i/$maxAttempts, status=$status): $($_.Exception.Message)"
+                if ($i -lt $maxAttempts) {
+                  $delay = $baseDelay * [math]::Pow(2, $i-1)   # 15 / 30 / 60 秒
+                  Start-Sleep -Seconds $delay
+                }
+              }
+            }
+            return $false
+          }
+
           $all = gh run list --branch ${{ github.ref_name }} --json databaseId,conclusion,createdAt,updatedAt,startedAt,workflowName --limit 100 | ConvertFrom-Json
           Write-Host "Total runs: $($all.Count)"
-          $api = "https://api.github.com/repos/${{ github.repository }}/actions/runs"
           $deleted = New-Object 'System.Collections.Generic.HashSet[long]'
           # Delete failed/cancelled/timed_out — separate pass by age: old first
-          $all | Where-Object { $_.conclusion -in @('failure','cancelled','timed_out') } | Sort-Object createdAt | ForEach-Object { Write-Host "Delete: $($_.databaseId)"; try { Invoke-RestMethod -Method Delete -Uri "$api/$($_.databaseId)" -Headers @{Authorization = "token $env:GH_TOKEN"} -ErrorAction Stop; [void]$deleted.Add($_.databaseId); Write-Host "  OK" } catch { Write-Host "  FAIL: $($_.Exception.Message)" } }
+          $all | Where-Object { $_.conclusion -in @('failure','cancelled','timed_out') } | Sort-Object createdAt | ForEach-Object {
+            Write-Host "Delete: $($_.databaseId)"; if (Remove-RunWithRetry $_.databaseId) { [void]$deleted.Add($_.databaseId) }
+          }
           # Delete short-duration runs (< 3 min)
-          $all | Where-Object { $_.updatedAt -and $_.startedAt -and ([DateTime]::Parse($_.updatedAt) - [DateTime]::Parse($_.startedAt)).TotalMinutes -lt 3 } | ForEach-Object { Write-Host "Delete short: $($_.databaseId)"; try { Invoke-RestMethod -Method Delete -Uri "$api/$($_.databaseId)" -Headers @{Authorization = "token $env:GH_TOKEN"} -ErrorAction Stop; [void]$deleted.Add($_.databaseId); Write-Host "  OK" } catch { Write-Host "  FAIL: $($_.Exception.Message)" } }
+          $all | Where-Object { $_.updatedAt -and $_.startedAt -and ([DateTime]::Parse($_.updatedAt) - [DateTime]::Parse($_.startedAt)).TotalMinutes -lt 3 } | ForEach-Object {
+            Write-Host "Delete short: $($_.databaseId)"; if (Remove-RunWithRetry $_.databaseId) { [void]$deleted.Add($_.databaseId) }
+          }
           # Keep 10 newest from remaining
           $good = $all | Where-Object { $_.conclusion -notin @('failure','cancelled','timed_out') -and -not $deleted.Contains($_.databaseId) }
           Write-Host "Good runs after cleanup (keep 10 of $($good.Count))"
-          $good | Select-Object -Skip 10 | ForEach-Object { Write-Host "Delete old: $($_.databaseId)"; try { Invoke-RestMethod -Method Delete -Uri "$api/$($_.databaseId)" -Headers @{Authorization = "token $env:GH_TOKEN"} -ErrorAction Stop; Write-Host "  OK" } catch { Write-Host "  FAIL: $($_.Exception.Message)" } }
+          $good | Select-Object -Skip 10 | ForEach-Object { Write-Host "Delete old: $($_.databaseId)"; Remove-RunWithRetry $_.databaseId }
           exit 0
 
       # Generate dynamic matrix from config
@@ -73,6 +101,8 @@ jobs:
                 iso_label     = $ver.iso_label
                 expected_hash = $rel.expected_hash
                 meta4_file    = "script_${meta4Build}_x64.meta4"
+                build_major   = $meta4Build
+                locale        = $locale
               }
             }
           }
@@ -119,15 +149,24 @@ jobs:
           }
 
           $meta4 = Invoke-RestMethodWithRetry "https://api.github.com/repos/adavak/Win_ISO_Patching_Scripts/contents/Scripts/${{ matrix.version.meta4_file }}"
-          $xmlText = [System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($meta4.content))
+          $rawBytes = [Convert]::FromBase64String($meta4.content)
+          $xmlText = [System.Text.Encoding]::UTF8.GetString($rawBytes)
+
+          # legacy：仅基于 meta4 内部 file name 列表（排序拼接），历史兼容、便于平滑迁移
           $names = [regex]::Matches($xmlText, 'file name="([^"]+)"') | ForEach-Object { $_.Groups[1].Value }
           $sorted = $names | Sort-Object { [int]($_ -replace '^.*kb(\d+).*$', '$1') }
           $combined = $sorted -join '|'
-          $hashBytes = [System.Security.Cryptography.SHA256]::Create().ComputeHash([System.Text.Encoding]::UTF8.GetBytes($combined))
-          $hash = [System.BitConverter]::ToString($hashBytes).Replace('-', '').ToLower()
-          "hash=$hash" >> $env:GITHUB_OUTPUT
+          $legacyBytes = [System.Security.Cryptography.SHA256]::Create().ComputeHash([System.Text.Encoding]::UTF8.GetBytes($combined))
+          $legacy = [System.BitConverter]::ToString($legacyBytes).Replace('-', '').ToLower()
 
-      # 3. Read last meta4 hash from Release body
+          # content：基于 meta4 原始字节的 SHA256（内容级指纹，可捕获 file URL/校验和变化）
+          $contentBytes = [System.Security.Cryptography.SHA256]::Create().ComputeHash($rawBytes)
+          $content = [System.BitConverter]::ToString($contentBytes).Replace('-', '').ToLower()
+
+          "legacy=$legacy" >> $env:GITHUB_OUTPUT
+          "content=$content" >> $env:GITHUB_OUTPUT
+
+      # 3. Read last meta4 hash（正文 STATE 注释为主，持久化资产 meta4-state.json 为次，防止正文被误改导致反复重建）
       - name: Read last meta4 hash
         id: last
         shell: pwsh
@@ -137,32 +176,62 @@ jobs:
           $repo   = "${{ github.repository }}"
           $prefix = "${{ matrix.version.release_tag }}"
 
-          $api = "https://api.github.com/repos/$repo/releases?per_page=50"
+          $legacy = ""
+          $v2 = ""
 
           try {
-            $releases = Invoke-RestMethod -Uri $api -Headers @{Authorization = "token $env:GH_TOKEN"}
+            $releases = Invoke-RestMethod -Uri "https://api.github.com/repos/$repo/releases?per_page=50" -Headers @{Authorization = "token $env:GH_TOKEN"}
 
             $matched = $releases |
               Where-Object { $_.tag_name -like "$prefix*" } |
               Sort-Object published_at -Descending |
               Select-Object -First 1
 
-            if ($matched -and $matched.body -match 'META4_HASH=([a-f0-9]{64})') {
-              "hash=$($matches[1])" >> $env:GITHUB_OUTPUT
-            } else {
-              "hash=" >> $env:GITHUB_OUTPUT
+            if ($matched) {
+              if ($matched.body -match 'META4_HASH_V2=([a-f0-9]{64})') { $v2 = $matches[1] }
+              if ($matched.body -match 'META4_HASH=([a-f0-9]{64})') { $legacy = $matches[1] }
+
+              # 次：从持久化资产读取（防正文 STATE 被删除）
+              $asset = $matched.assets | Where-Object { $_.name -eq 'meta4-state.json' } | Select-Object -First 1
+              if ($asset) {
+                try {
+                  $req = Invoke-WebRequest -Uri $asset.url -Headers @{Authorization = "token $env:GH_TOKEN"; Accept = "application/octet-stream" } -UseBasicParsing
+                  $s = $req.Content | ConvertFrom-Json
+                  if ($s.v2 -and -not $v2) { $v2 = $s.v2 }
+                  if ($s.legacy -and -not $legacy) { $legacy = $s.legacy }
+                } catch { Write-Host "读取 meta4-state.json 资产失败（忽略）: $($_.Exception.Message)" }
+              }
             }
           } catch {
-            "hash=" >> $env:GITHUB_OUTPUT
+            Write-Host "读取上次哈希失败（视为无记录）: $($_.Exception.Message)"
           }
+
+          "legacy=$legacy" >> $env:GITHUB_OUTPUT
+          "v2=$v2" >> $env:GITHUB_OUTPUT
 
       - name: Check if workflow should run
         id: check
         shell: pwsh
         run: |
-          if ("${{ steps.script.outputs.hash }}" -eq "${{ steps.last.outputs.hash }}") {
+          $v2     = "${{ steps.last.outputs.v2 }}"
+          $legacy = "${{ steps.last.outputs.legacy }}"
+          $curV2  = "${{ steps.script.outputs.content }}"
+          $curLeg = "${{ steps.script.outputs.legacy }}"
+
+          $skip = $false
+          if ($v2 -and $curV2 -eq $v2) {
+            # 内容级指纹一致 → 无需构建
+            $skip = $true
+          } elseif (-not $v2 -and $legacy -and $curLeg -eq $legacy) {
+            # 存量 Release 尚未写入 V2：回退到 legacy 判定，避免误触发重建
+            $skip = $true
+          }
+
+          if ($skip) {
+            Write-Host "meta4 未变化（v2=$v2），跳过构建"
             "run=false" >> $env:GITHUB_OUTPUT
           } else {
+            Write-Host "检测到 meta4 变化，开始构建"
             "run=true" >> $env:GITHUB_OUTPUT
           }
 
@@ -256,10 +325,14 @@ jobs:
           $actual = ($hashMatches | Select-Object -First 1).Trim().ToLower()
           if ($actual -ne "${{ matrix.version.expected_hash }}") { throw "SHA256 mismatch: $actual" }
 
-      # 9. Run Start.cmd (auto exit via choice 9)
+      # 9. Run Start.cmd（上游 adavak/Win_ISO_Patching_Scripts 的菜单中 9 = 退出/完成；
+      #    此处通过管道连续喂入 9 触发自动结束。注意：9 的具体语义依赖上游菜单定义（隐式契约）。
+      #    加硬超时保护：若上游菜单变更导致 Start.cmd 挂起，最多运行 5h 后由 step 超时兜底，
+      #    避免一直占用到 6h job 上限；超时即失败（不会创建半成品 Release）。
       - name: Run Start.cmd
         if: steps.check.outputs.run == 'true'
         shell: cmd
+        timeout-minutes: 300
         run: |
           cd patcher
           (
@@ -276,10 +349,16 @@ jobs:
         run: |
           $sevenZip = "${{ env.SEVENZIP }}"
           $iso = Get-ChildItem patcher -Filter *.iso -Recurse | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+          if (-not $iso) { throw "原始 ISO 未生成，Start.cmd 可能未正常完成" }
 
-          # Version/build and locale
-          if ($iso.Name -match '(\d{1,6}\.\d{1,6})') { $versionBuild = $matches[1]; $version,$build=$versionBuild -split '\.' }
-          if ($iso.Name -match '([A-Za-z]+-[A-Za-z]+)') { $locale = $matches[1].ToLower() }
+          # 版本号（格式 X.Y，如 26200.8973）从 ISO 文件名解析；locale 直接取自矩阵配置（不再依赖文件名猜测）
+          if ($iso.Name -match '(\d{5,6}\.\d{3,5})') {
+            $versionBuild = $matches[1]
+            $version, $build = $versionBuild -split '\.'
+          } else {
+            throw "无法从 ISO 文件名解析版本号: $($iso.Name)"
+          }
+          $locale = "${{ matrix.version.locale }}".ToLower()
 
           $date = Get-Date -Format "yyMMdd"
           $time = "0800"
@@ -288,7 +367,7 @@ jobs:
           $hashOutput = & $sevenZip h -scrcSHA256 "$($iso.FullName)"
           $hashMatches = $hashOutput | Select-String -Pattern '([a-fA-F0-9]{64})' | ForEach-Object { $_.Matches[0].Value }
           $hash = ($hashMatches | Select-Object -First 1).Trim().ToLower()
-          if (-not $hash -or $hash.Length -lt 8) { throw "Failed to parse valid SHA256 from 7z output" }
+          if (-not $hash -or $hash.Length -lt 8) { throw "无法从 7z 输出解析有效 SHA256" }
           $hash8 = $hash.Substring($hash.Length-8,8)
 
           $newName = "$version.$build.$date-$time.${{ matrix.version.iso_label }}_${locale}_$hash8.iso"
@@ -296,6 +375,13 @@ jobs:
 
           # Split using 7z
           & $sevenZip a "release\$newName.zip" "patcher\$newName" -v${{ env.SPLIT_SIZE }}
+
+          # 持久化状态资产：与 Release 正文 STATE 注释互为备份（防正文被误改导致反复重建）
+          $state = [ordered]@{
+            legacy = "${{ steps.script.outputs.legacy }}"
+            v2     = "${{ steps.script.outputs.content }}"
+          }
+          $state | ConvertTo-Json -Compress | Set-Content -Path "release\meta4-state.json" -Encoding utf8
 
           $runTimeTag = (Get-Date).ToString("yyyyMMdd-HHmm")
           $tag = "${{ matrix.version.release_tag }}-$version.$build-$runTimeTag"
@@ -329,9 +415,12 @@ jobs:
             ISO SHA256: ${{ steps.iso.outputs.iso_sha256 }}
 
             <!-- STATE
-            META4_HASH=${{ steps.script.outputs.hash }}
+            META4_HASH=${{ steps.script.outputs.legacy }}
+            META4_HASH_V2=${{ steps.script.outputs.content }}
             -->
-          files: release/*.zip.*
+          files: |
+            release/*.zip.*
+            release/meta4-state.json
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 

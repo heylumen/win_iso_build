@@ -166,7 +166,7 @@ jobs:
           "legacy=$legacy" >> $env:GITHUB_OUTPUT
           "content=$content" >> $env:GITHUB_OUTPUT
 
-      # 3. Read last meta4 hash（正文 STATE 注释为主，持久化资产 meta4-state.json 为次，防止正文被误改导致反复重建）
+      # 3. Read last meta4 hash（正文 STATE 注释为主，仓库内提交文件 .github/meta4-state.json 为次，防止正文被误改导致反复重建）
       - name: Read last meta4 hash
         id: last
         shell: pwsh
@@ -191,15 +191,15 @@ jobs:
               if ($matched.body -match 'META4_HASH_V2=([a-f0-9]{64})') { $v2 = $matches[1] }
               if ($matched.body -match 'META4_HASH=([a-f0-9]{64})') { $legacy = $matches[1] }
 
-              # 次：从持久化资产读取（防正文 STATE 被删除）
-              $asset = $matched.assets | Where-Object { $_.name -eq 'meta4-state.json' } | Select-Object -First 1
-              if ($asset) {
+              # 次：从本地提交文件读取（防 Release 正文/资产均被误改；
+              #     该文件位于仓库内、不在 Release 资产中，因此不会污染博客下载列表）
+              $stateFile = Join-Path $env:GITHUB_WORKSPACE ".github/meta4-state.json"
+              if (-not $v2 -and (Test-Path $stateFile)) {
                 try {
-                  $req = Invoke-WebRequest -Uri $asset.url -Headers @{Authorization = "token $env:GH_TOKEN"; Accept = "application/octet-stream" } -UseBasicParsing
-                  $s = $req.Content | ConvertFrom-Json
-                  if ($s.v2 -and -not $v2) { $v2 = $s.v2 }
-                  if ($s.legacy -and -not $legacy) { $legacy = $s.legacy }
-                } catch { Write-Host "读取 meta4-state.json 资产失败（忽略）: $($_.Exception.Message)" }
+                  $sf = Get-Content $stateFile | ConvertFrom-Json
+                  $fk = $sf."${{ matrix.version.release_tag }}"
+                  if ($fk) { $v2 = $fk }
+                } catch { Write-Host "读取本地状态文件失败（忽略）: $($_.Exception.Message)" }
               }
             }
           } catch {
@@ -376,13 +376,6 @@ jobs:
           # Split using 7z
           & $sevenZip a "release\$newName.zip" "patcher\$newName" -v${{ env.SPLIT_SIZE }}
 
-          # 持久化状态资产：与 Release 正文 STATE 注释互为备份（防正文被误改导致反复重建）
-          $state = [ordered]@{
-            legacy = "${{ steps.script.outputs.legacy }}"
-            v2     = "${{ steps.script.outputs.content }}"
-          }
-          $state | ConvertTo-Json -Compress | Set-Content -Path "release\meta4-state.json" -Encoding utf8
-
           $runTimeTag = (Get-Date).ToString("yyyyMMdd-HHmm")
           $tag = "${{ matrix.version.release_tag }}-$version.$build-$runTimeTag"
           $isoFile = "patcher\$newName"
@@ -418,9 +411,7 @@ jobs:
             META4_HASH=${{ steps.script.outputs.legacy }}
             META4_HASH_V2=${{ steps.script.outputs.content }}
             -->
-          files: |
-            release/*.zip.*
-            release/meta4-state.json
+          files: release/*.zip.*
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
@@ -442,4 +433,51 @@ jobs:
             Write-Host "已向博客仓库发送 win_iso_updated 事件，触发即时同步"
           } catch {
             Write-Host "通知博客失败（不影响本次构建）: $($_.Exception.Message)"
+          }
+
+  # 持久化 meta4 状态文件：与 Release 正文 STATE 注释互为备份，防止正文被误改导致反复重建。
+  # 该文件位于仓库内、不进 Release 资产，因此不会污染博客下载列表。
+  # 单 job 串行（配合 workflow 级 concurrency），无并行 push 冲突；失败不影响构建结果。
+  persist-state:
+    needs: [build]
+    if: always()
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: 写入 meta4 状态文件
+        continue-on-error: true
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          function Get-ContentHash([string]$meta4) {
+            $uri = "https://api.github.com/repos/adavak/Win_ISO_Patching_Scripts/contents/Scripts/$meta4"
+            $m = Invoke-RestMethod -Uri $uri -Headers @{Authorization = "token $env:GH_TOKEN"}
+            $raw = [Convert]::FromBase64String($m.content)
+            $b = [System.Security.Cryptography.SHA256]::Create().ComputeHash($raw)
+            return [System.BitConverter]::ToString($b).Replace('-', '').ToLower()
+          }
+          try {
+            $cfg = Get-Content .github/version-config.json | ConvertFrom-Json -AsHashtable
+            $state = @{}
+            foreach ($build in $cfg.versions.Keys) {
+              $meta4Build = $build -replace '_iot$', ''
+              $file = "script_${meta4Build}_x64.meta4"
+              foreach ($locale in $cfg.locales) {
+                $rel = $cfg.releases[$locale][$build]
+                if ($rel -and $rel.release_tag) { $state[$rel.release_tag] = Get-ContentHash $file }
+              }
+            }
+            $state | ConvertTo-Json -Depth 2 | Set-Content -Path ".github/meta4-state.json" -Encoding utf8
+            git config user.name "github-actions[bot]"
+            git config user.email "github-actions[bot]@users.noreply.github.com"
+            git add .github/meta4-state.json
+            git commit -m "ci: 更新 meta4 状态文件" | Out-Null
+            git pull --rebase origin ${{ github.ref_name }}
+            git push
+            Write-Host "已写入 .github/meta4-state.json（$(($state.Keys | Measure-Object).Count) 个条目）"
+          } catch {
+            Write-Host "写入状态文件失败（忽略，正文 STATE 仍为主）：$($_.Exception.Message)"
           }

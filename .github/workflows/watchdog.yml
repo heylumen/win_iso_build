@@ -53,4 +53,5 @@ jobs:
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add tools/watchdog-state.json
           git commit -m "watchdog: 更新微软构建基线" || echo "无变化可提交"
+          git pull --rebase origin ${{ github.ref_name }}
           git push

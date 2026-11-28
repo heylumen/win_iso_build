@@ -13,6 +13,13 @@ on:
 permissions:
   contents: write
   actions: write
+  # 🔴 推送 tag 时，GitHub 会校验 tag 所指向的 commit 是否包含 .github/workflows/ 变更；
+  # 若包含则要求 token 具备 workflows:write，否则 git push 会被拒：
+  #   "refusing to allow a GitHub App to create or update workflow ... without `workflows` permission"
+  # 本仓库持续维护 auto_patch.yml，因此该权限不可省。缺失时的表现极具迷惑性：
+  # 下载/解压/打补丁/分卷全部成功，只在「Create Git tag」失败 → Release 发不出去
+  # （2026-11-28 实际发生：ISO 已打出 26300.10075，却因推 tag 被拒而无法发布）。
+  workflows: write
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true

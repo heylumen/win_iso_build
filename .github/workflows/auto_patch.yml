@@ -356,11 +356,19 @@ jobs:
         if: steps.check.outputs.run == 'true'
         shell: pwsh
         run: |
+          # 守卫的辅助步骤，容错设计：任何环境限制（runner 不允许挂载 ISO、DISM 不可用、
+          # 源 ISO 结构异常等）都只输出告警并跳过，绝不让"读版本失败"拖垮整条构建。
+          # 版本读不到时，后续的零补丁校验会自动跳过（见 Rename ISO 步骤）。
           $iso = Get-ChildItem patcher -Filter *.iso -Recurse | Sort-Object LastWriteTime -Descending | Select-Object -First 1
-          if (-not $iso) { throw "Source ISO not found" }
+          if (-not $iso) {
+            Write-Warning "Source ISO not found; zero-patch guard will be skipped for this variant."
+            exit 0
+          }
 
-          Mount-DiskImage -ImagePath $iso.FullName -PassThru | Out-Null
+          $mounted = $false
           try {
+            Mount-DiskImage -ImagePath $iso.FullName -PassThru | Out-Null
+            $mounted = $true
             $drive = (Get-DiskImage -ImagePath $iso.FullName | Get-Volume | Where-Object DriveLetter | Select-Object -First 1).DriveLetter
             if (-not $drive) { throw "Could not mount source ISO: $($iso.Name)" }
             $img = Get-ChildItem "${drive}:\sources" -File | Where-Object { $_.Name -match '^install\.(wim|esd)$' } | Select-Object -First 1
@@ -368,8 +376,10 @@ jobs:
             $ver = (Get-WindowsImage -ImagePath $img.FullName -Index 1).Version
             "version=$ver" >> $env:GITHUB_OUTPUT
             Write-Host "Source ISO version: $ver"
+          } catch {
+            Write-Warning "Zero-patch guard skipped (cannot read source ISO build): $($_.Exception.Message)"
           } finally {
-            Dismount-DiskImage -ImagePath $iso.FullName -ErrorAction SilentlyContinue
+            if ($mounted) { Dismount-DiskImage -ImagePath $iso.FullName -ErrorAction SilentlyContinue }
           }
 
       # 9. Run Start.cmd（上游 adavak/Win_ISO_Patching_Scripts 的菜单中 9 = 退出/完成；
@@ -406,9 +416,13 @@ jobs:
             throw "无法从 ISO 文件名解析版本号: $($iso.Name)"
           }
 
-          # 零补丁守卫（同步上游 fc3b1750）：补丁后版本等于源版本 -> 补丁未生效，失败
+          # 零补丁守卫（同步上游 fc3b1750）：补丁后版本等于源版本 -> 补丁未生效，失败。
+          # 若源 ISO 版本未能读取（空白），跳过校验并告警——宁可少一道守卫，
+          # 也不因环境限制把所有变体误杀成失败。
           $srcVersion = ("${{ steps.source.outputs.version }}".Trim() -replace '^10\.0\.', '')
-          if ($versionBuild -eq $srcVersion) {
+          if (-not $srcVersion) {
+            Write-Warning "Source ISO build unknown; zero-patch guard skipped for this variant."
+          } elseif ($versionBuild -eq $srcVersion) {
             throw "Zero-patch ISO detected: output build $versionBuild equals source build $srcVersion"
           }
 

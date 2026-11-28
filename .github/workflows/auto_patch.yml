@@ -348,6 +348,30 @@ jobs:
           $actual = ($hashMatches | Select-Object -First 1).Trim().ToLower()
           if ($actual -ne "${{ matrix.version.expected_hash }}") { throw "SHA256 mismatch: $actual" }
 
+      # 8b. 零补丁守卫（同步上游 fc3b1750）：先记录源 ISO 内 install.wim 的版本，
+      #     补丁后与之对比；若版本相同说明补丁实际未生效（脚本静默失败），
+      #     此时直接失败，绝不把「未打补丁的源镜像」当作新版本发布。
+      - name: Read source ISO build
+        id: source
+        if: steps.check.outputs.run == 'true'
+        shell: pwsh
+        run: |
+          $iso = Get-ChildItem patcher -Filter *.iso -Recurse | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+          if (-not $iso) { throw "Source ISO not found" }
+
+          Mount-DiskImage -ImagePath $iso.FullName -PassThru | Out-Null
+          try {
+            $drive = (Get-DiskImage -ImagePath $iso.FullName | Get-Volume | Where-Object DriveLetter | Select-Object -First 1).DriveLetter
+            if (-not $drive) { throw "Could not mount source ISO: $($iso.Name)" }
+            $img = Get-ChildItem "${drive}:\sources" -File | Where-Object { $_.Name -match '^install\.(wim|esd)$' } | Select-Object -First 1
+            if (-not $img) { throw "install.wim/esd not found in source ISO" }
+            $ver = (Get-WindowsImage -ImagePath $img.FullName -Index 1).Version
+            "version=$ver" >> $env:GITHUB_OUTPUT
+            Write-Host "Source ISO version: $ver"
+          } finally {
+            Dismount-DiskImage -ImagePath $iso.FullName -ErrorAction SilentlyContinue
+          }
+
       # 9. Run Start.cmd（上游 adavak/Win_ISO_Patching_Scripts 的菜单中 9 = 退出/完成；
       #    此处通过管道连续喂入 9 触发自动结束。注意：9 的具体语义依赖上游菜单定义（隐式契约）。
       #    加硬超时保护：若上游菜单变更导致 Start.cmd 挂起，最多运行 5h 后由 step 超时兜底，
@@ -381,6 +405,13 @@ jobs:
           } else {
             throw "无法从 ISO 文件名解析版本号: $($iso.Name)"
           }
+
+          # 零补丁守卫（同步上游 fc3b1750）：补丁后版本等于源版本 -> 补丁未生效，失败
+          $srcVersion = ("${{ steps.source.outputs.version }}".Trim() -replace '^10\.0\.', '')
+          if ($versionBuild -eq $srcVersion) {
+            throw "Zero-patch ISO detected: output build $versionBuild equals source build $srcVersion"
+          }
+
           $locale = "${{ matrix.version.locale }}".ToLower()
 
           $date = Get-Date -Format "yyMMdd"
@@ -396,8 +427,16 @@ jobs:
           $newName = "$version.$build.$date-$time.${{ matrix.version.iso_label }}_${locale}_$hash8.iso"
           Rename-Item -Path $iso.FullName -NewName $newName
 
-          # Split using 7z
-          & $sevenZip a "release\$newName.zip" "patcher\$newName" -v${{ env.SPLIT_SIZE }}
+          # Split using 7z from inside patcher, so the ISO sits at the archive root
+          # 同步上游 f6d0a4ec：在 patcher 目录内压缩，解压后 ISO 直接位于 zip 根目录
+          # （不再嵌在 patcher/ 子目录里），并检查 7z 退出码，避免静默产出半成品分卷。
+          Push-Location patcher
+          try {
+            & $sevenZip a "..\release\$newName.zip" "$newName" -v${{ env.SPLIT_SIZE }}
+            if ($LASTEXITCODE -ne 0) { throw "7z split failed with exit code $LASTEXITCODE" }
+          } finally {
+            Pop-Location
+          }
 
           $runTimeTag = (Get-Date).ToString("yyyyMMdd-HHmm")
           $tag = "${{ matrix.version.release_tag }}-$version.$build-$runTimeTag"

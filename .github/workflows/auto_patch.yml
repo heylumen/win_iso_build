@@ -113,6 +113,11 @@ jobs:
   build:
     needs: generate-matrix
     strategy:
+      # 单变体失败不再取消其余变体：2026-11-28 run 中 Win10/Win11 IoT en-US 下载失败，
+      # 把已成功下载并校验 ISO 的 Win10 LTSC 2021 等 10 个 job 一并 cancel（fail-fast 连坐）。
+      fail-fast: false
+      # 限制并发：12 个变体同时从 GitHub Releases 拉取数百 MB 分卷，极易触发限流/超时。
+      max-parallel: 2
       matrix:
         version: ${{ fromJSON(needs.generate-matrix.outputs.matrix) }}
     runs-on: windows-latest
@@ -298,8 +303,26 @@ jobs:
           $json = Invoke-RestMethodWithRetry $api
           $parts = $json.assets | Where-Object { $_.name -match '\.zip\.\d+$' } | Sort-Object name
           if ($parts.Count -eq 0) { throw "No zip parts found for ${{ matrix.version.release_tag }}" }
+          # 分卷下载加超时与重试：原实现无任何重试，一次网络抖动即 throw，
+          # 再叠加 fail-fast 会连坐取消其余已就绪的变体。
+          function Invoke-DownloadWithRetry([string]$uri, [string]$outFile, [int]$maxAttempts=3) {
+            for ($i = 1; $i -le $maxAttempts; $i++) {
+              try {
+                Invoke-WebRequest -Uri $uri -OutFile $outFile -TimeoutSec 1800
+                return
+              } catch {
+                Write-Host "Download failed (attempt $i/$maxAttempts): $($_.Exception.Message)"
+                if ($i -lt $maxAttempts) {
+                  Write-Host "Retrying in 60 seconds..."
+                  Start-Sleep -Seconds 60
+                } else {
+                  throw
+                }
+              }
+            }
+          }
           foreach ($p in $parts) {
-            Invoke-WebRequest $p.browser_download_url -OutFile "download\$($p.name)"
+            Invoke-DownloadWithRetry -uri $p.browser_download_url -outFile "download\$($p.name)"
           }
 
       # 7. Merge & extract using 7z

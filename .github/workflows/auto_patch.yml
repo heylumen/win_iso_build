@@ -13,13 +13,7 @@ on:
 permissions:
   contents: write
   actions: write
-  # 🔴 推送 tag 时，GitHub 会校验 tag 所指向的 commit 是否包含 .github/workflows/ 变更；
-  # 若包含则要求 token 具备 workflows:write，否则 git push 会被拒：
-  #   "refusing to allow a GitHub App to create or update workflow ... without `workflows` permission"
-  # 本仓库持续维护 auto_patch.yml，因此该权限不可省。缺失时的表现极具迷惑性：
-  # 下载/解压/打补丁/分卷全部成功，只在「Create Git tag」失败 → Release 发不出去
-  # （2026-11-28 实际发生：ISO 已打出 26300.10075，却因推 tag 被拒而无法发布）。
-  workflows: write
+
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
@@ -467,18 +461,21 @@ jobs:
           "iso_file=$isoFile" >> $env:GITHUB_OUTPUT
           "iso_sha256=$hash" >> $env:GITHUB_OUTPUT
 
-      # 11. Create Git tag
-      - name: Create Git tag
-        if: steps.check.outputs.run == 'true'
-        shell: pwsh
-        run: |
-          git config user.name "github-actions"
-          git config user.email "actions@github.com"
-          $tag = "${{ steps.iso.outputs.tag }}"
-          if (-not (git tag -l $tag)) {
-            git tag $tag
-            git push origin $tag
-          }
+      # 11. 【已移除】原「Create Git tag」步骤（2026-11-28）
+      #
+      # 原实现用 git tag + git push origin <tag> 创建标签，但这在本仓库必然失败：
+      # 推 tag 时 GitHub 会校验 tag 所指向的 commit 是否包含 .github/workflows/ 变更；
+      # 本仓库持续维护 auto_patch.yml，几乎每个 commit 都含 workflow 变更，于是被拒：
+      #   "refusing to allow a GitHub App to create or update workflow
+      #    `.github/workflows/auto_patch.yml` without `workflows` permission"
+      # 注意：该 workflows 权限并非 permissions: 块支持的 scope（合法清单里没有它，
+      # 写了会报 "Unexpected value 'workflows'" 导致 workflow 无法解析），
+      # GITHUB_TOKEN 也无法获得 —— 属 GitHub 的设计限制，不可能靠加一行权限解决。
+      #
+      # 改由下一步的 softprops/action-gh-release 通过 Releases API 创建 tag：
+      # API 创建 release 时若 tag 不存在会自动补建，不受 git push 的 workflows 限制。
+      # 典型症状（便于日后识别）：下载/解压/打补丁/分卷全部 success，
+      # 只在打 tag 处失败 → ISO 已产出却发不出去。
 
       # 12. Create GitHub Release
       - name: Create Release
